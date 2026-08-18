@@ -461,11 +461,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
-		// Log based on message type
+		// Log message reception WITHOUT the body. Raw message content is private
+		// and must not land in plaintext logs (see fix punch-list #6); log only
+		// metadata + a length marker so sync is still observable.
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s media, %d bytes]\n", timestamp, direction, sender, mediaType, len(content))
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: [text, %d chars]\n", timestamp, direction, sender, len(content))
 		}
 	}
 }
@@ -641,7 +643,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -675,108 +677,24 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
+// Start a REST API server to expose the WhatsApp client functionality.
+//
+// READ-ONLY DIGEST BUILD: the /api/send and /api/download handlers have been
+// removed deliberately. The digest only ever reads messages straight from the
+// SQLite store (the Python MCP server queries messages.db directly), so the
+// bridge needs no write/send/download surface. The server is also bound to
+// 127.0.0.1 only, so nothing on the LAN can reach it. See the security review
+// and fix punch-list in projects/2026-05-personalos-setup/comms-digest-setup.md.
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
+	// Health endpoint only — no send, no download.
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 	})
 
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req DownloadMediaRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.MessageID == "" || req.ChatJID == "" {
-			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
-			return
-		}
-
-		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
-
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Handle download result
-		if !success || err != nil {
-			errMsg := "Unknown error"
-			if err != nil {
-				errMsg = err.Error()
-			}
-
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(DownloadMediaResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
-			})
-			return
-		}
-
-		// Send successful response
-		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
-		})
-	})
-
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Bind to loopback only so the bridge is never reachable off-host.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("Starting REST API server on %s (read-only: health only)...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
@@ -800,14 +718,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +891,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +906,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1072,8 +990,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				// Log metadata only — raw message bodies are private and must
+				// never hit the log (same redaction as live-message logging).
+				logger.Infof("History message: [%d chars, media: %q]", len(content), mediaType)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
@@ -1131,13 +1050,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
+					// Log metadata only — never the body or filename (private).
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
+						logger.Infof("Stored message: [%s] %s -> %s: [%s media, %d bytes]",
+							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, len(content))
 					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+						logger.Infof("Stored message: [%s] %s -> %s: [text, %d chars]",
+							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, len(content))
 					}
 				}
 			}
