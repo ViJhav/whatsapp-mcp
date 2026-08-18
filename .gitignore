@@ -1,3 +1,6 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Compiled Go bridge binary (27M, built from whatsapp-bridge/ sources)
+whatsapp-bridge/whatsapp-bridge
