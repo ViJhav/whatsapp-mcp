@@ -687,9 +687,16 @@ func extractDirectPathFromURL(url string) string {
 // and fix punch-list in projects/2026-05-personalos-setup/comms-digest-setup.md.
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Health endpoint only — no send, no download.
+	// ok reflects the live WhatsApp link, not just "the process is up": through the
+	// 2026-09-29 `Client outdated (405)` outage the old constant {"ok": true} kept
+	// reporting healthy for five days while nothing synced.
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		connected, loggedIn := client.IsConnected(), client.IsLoggedIn()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		if !(connected && loggedIn) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": connected && loggedIn, "connected": connected, "logged_in": loggedIn})
 	})
 
 	// Bind to loopback only so the bridge is never reachable off-host.
